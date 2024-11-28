@@ -12,7 +12,8 @@ use serde::ser::Error;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::time::timeout;
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::style::{style, Attribute, Color, SetForegroundColor, Stylize};
 use serde::de::DeserializeOwned;
 use tokio::time::error::Elapsed;
 
@@ -135,7 +136,7 @@ fn serialize_message<T: Serialize>(input: &T) -> Vec<u8> {
     let input_string = serde_json::to_string(&input).unwrap();
     let serialized = input_string.as_bytes();
     let length: u32 = serialized.len() as u32;
-    let mut vec: Vec<u8> = Vec::with_capacity(length as usize);
+    let mut vec: Vec<u8> = Vec::with_capacity((length + 4) as usize);
     vec.extend_from_slice(&length.to_le_bytes());
     vec.extend_from_slice(serialized);
 
@@ -147,15 +148,25 @@ async fn deserialize_message<T: DeserializeOwned>(
 ) -> Result<Option<T>, LiarsDiceError> {
     let mut len_buf: [u8; 4] = [0; 4];
     match stream.read_exact(&mut len_buf).await {
-        Ok(0) => {return Ok(None)},
+        Ok(0) => return Ok(None),
         Ok(_) => {},
-        Err(e) => {return Err(LiarsDiceError::IoError(e.to_string()))},
+        Err(e) => return Err(LiarsDiceError::IoError(e.to_string())),
     }
     let length = u32::from_le_bytes(len_buf) as usize;
     let mut buffer = vec![0; length];
-    stream.read_exact(&mut buffer).await?; // std::io::Error
-    let message = serde_json::from_slice::<T>(&buffer[..length])?; // serde_json::Error
-    Ok(Some(message))
+    match stream.read_exact(&mut buffer).await {
+        Err(e) => {
+            return Err(LiarsDiceError::IoError(e.to_string()))
+        },
+        Ok(0) => {
+            return Err(LiarsDiceError::IoError(format!("Read 0 bytes but expected {length} bytes")));
+        }
+        Ok(n) => {},
+    }
+    match serde_json::from_slice::<T>(&buffer[..length]) {
+        Ok(message) => Ok(Some(message)),
+        Err(_) => Err(LiarsDiceError::JsonError(String::from("Problem deserializing string"))),
+    }
 }
 
 async fn serialize_players(players_hash: Arc<AsyncMutex<HashMap<SocketAddr, PlayerInfo>>>, include_die: bool) -> Vec<PlayerSerialize> {
@@ -219,16 +230,54 @@ async fn handle_client(
     num_players: Arc<AtomicUsize>,
     num_votes: Arc<AtomicUsize>,
     mut broadcast_rx: Receiver<ClientMessage>,
-    mut mpsc_tx: Sender<ServerMessage>
+    mut mpsc_tx: Sender<ClientMessage>
 )
     -> Result<(), LiarsDiceError> {
     // Read data from the socket
-    client_join(socket, addr.clone(), players_hash.clone(), num_players.clone()).await?;
+    match client_join(socket, addr.clone(), players_hash.clone(), num_players.clone()).await {
+        Ok(()) => {
+            let mut players = players_hash.lock().await;
+            let player = match players.get_mut(&addr) {
+                Some(p) => p,
+                None => {
+                    return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
+                }
+            };
+            if let Err(_) = mpsc_tx.send(ClientMessage::AcceptClient(player.name.clone())).await {
+                eprintln!("Failed to send message to server");
+            }
+        }
+        Err(e) => return Err(e),
+    }
     let mut retries = 0;
     const MAX_RETRIES: usize = 5;
 
     // Lobby loop
     loop {
+        if let Ok(msg) = broadcast_rx.try_recv() {
+            let serialized: Result<ClientMessage, LiarsDiceError> = match msg {
+                ClientMessage::StartGame => Ok(ClientMessage::StartGame),
+                ClientMessage::PlayerLeft(p_name) => Ok(ClientMessage::PlayerLeft(p_name)),
+                ClientMessage::AcceptClient(p_name) => Ok(ClientMessage::AcceptClient(p_name)),
+                ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes) =>
+                    Ok(ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes)),
+                ClientMessage::Kick(p_name) => Ok(ClientMessage::Kick(p_name)),
+                _ => Err(LiarsDiceError::Other(String::from("Unknown message type"))),
+            };
+            match serialized {
+                Ok(serialized) => {
+                    let mut players = players_hash.lock().await;
+                    let player = match players.get_mut(&addr) {
+                        Some(p) => p,
+                        None => {
+                            return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
+                        }
+                    };
+                    player.stream.write_all(serialize_message(&serialized).as_slice()).await?;
+                }
+                Err(_) => eprintln!("Failed to send message to client"),
+            }
+        }
         // Take stream and clone name without holding onto the lock
         let timeout_result;
         let name;
@@ -245,16 +294,25 @@ async fn handle_client(
             timeout_result = timeout(Duration::from_millis(20), deserialize_message(&mut player.stream)).await;
         }
         // Test connection
-        let message: Result<StartMessage, LiarsDiceError> = match timeout_result {
-            Ok(Ok(n)) => {
-                println!("Got some data");
+        let message_received: Result<Option<StartMessage>, LiarsDiceError> = match timeout_result {
+            Ok(n) => {
                 if retries > 0 {
-                    println!("{}'s connection re-established!", name);
                     retries = 0;
+                    println!("{}'s connection re-established!", name);
                 }
-                n.unwrap()
+                n
             },
-            Ok(Err(_)) => {
+            Err(_) => continue,
+        };
+        let message_option = match message_received {
+            Ok(n) => {
+                if retries > 0 {
+                    retries = 0;
+                    println!("{}'s connection re-established!", name);
+                }
+                n
+            },
+            Err(_) => {
                 retries += 1;
                 println!("{}'s connection lost. Retrying... ({}/{})", name, retries, MAX_RETRIES);
                 if retries >= MAX_RETRIES {
@@ -267,8 +325,11 @@ async fn handle_client(
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 continue;
-            }
-            _ => continue,
+            },
+        };
+        let message = match message_option {
+            Some(m) => m,
+            None => continue,
         };
         {
             let mut players = players_hash.lock().await;
@@ -280,53 +341,37 @@ async fn handle_client(
             };
             // Read message content
             match message {
-                Ok(StartMessage::VoteStart(vote)) => {
-                    if vote && !player.start_game {
+                StartMessage::VoteStart(vote) => {
+                    if vote == player.start_game {
+                        continue
+                    }
+                    else if vote && !player.start_game {
                         num_votes.fetch_add(1, Ordering::SeqCst);
                     } else if !vote && player.start_game {
                         num_votes.fetch_sub(1, Ordering::SeqCst);
-                    };
+                    }
                     player.start_game = vote;
 
-                    println!("{} voted {} to start game ({}/{})", player.name, if vote { "YES" } else { "NO" },
-                             num_votes.load(Ordering::SeqCst), num_players.load(Ordering::SeqCst));
+                    print!("{} voted ", player.name);
+                    if vote {
+                        print!("{}", style("YES").with(Color::Green).attribute(Attribute::Bold).attribute(Attribute::Underlined));
+                    } else {
+                        print!("{}", style("NO").with(Color::Red).attribute(Attribute::Bold).attribute(Attribute::Underlined));
+                    }
+                    println!(" to start game ({}/{})", num_votes.load(Ordering::SeqCst), num_players.load(Ordering::SeqCst));
                 }
-                Ok(StartMessage::Exit) => {
+                StartMessage::Exit => {
                     println!("{} left", player.name);
                     num_players.fetch_sub(1, Ordering::SeqCst);
                     if player.start_game {
                         num_votes.fetch_sub(1, Ordering::SeqCst);
                     }
                     players.remove(&addr);
+                    return Ok(())
                 }
-                Err(_) => continue,
-                _ => {}
+                _ => continue,
             }
         }
-
-        if let Ok(msg) = broadcast_rx.try_recv() {
-            let serialized = match msg {
-                ClientMessage::StartGame => serde_json::to_string(&ClientMessage::StartGame),
-                ClientMessage::PlayerLeft(p_name) => serde_json::to_string(&ClientMessage::PlayerLeft(p_name)),
-                ClientMessage::AcceptClient(p_name) => serde_json::to_string(&ClientMessage::AcceptClient(p_name)),
-                ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes) =>
-                    serde_json::to_string(&ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes)),
-                ClientMessage::Kick(p_name) => serde_json::to_string(&ClientMessage::Kick(p_name)),
-                _ => Err(serde_json::Error::custom("Unknown message type"))
-            };
-            if let Ok(s_msg) = serialized {
-                let mut players = players_hash.lock().await;
-                let player = match players.get_mut(&addr) {
-                    Some(p) => p,
-                    None => {
-                        return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
-                    }
-                };
-                player.stream.write_all(serialize_message(&s_msg).as_slice()).await?;
-            }
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Ok(())
 }
@@ -347,38 +392,64 @@ async fn run_server() -> Result<(), LiarsDiceError> {
     let (broadcast_tx, _) = broadcast::channel(16);
 
     // Create an mpsc channel for clients-to-server communication
-    let (server_tx, mut server_rx) = mpsc::channel(16);
+    let (server_tx, mut server_rx): (Sender<ClientMessage>, mpsc::Receiver<ClientMessage>) = mpsc::channel(16);
 
+    // Lobby loop
     loop {
-        let (socket, addr) = listener.accept().await?;
-        println!("New connection from: {}", addr);
-
-        let players_hash_clone = players_hash.clone();
-        let num_players_clone = num_players.clone();
-        let num_votes_clone = num_votes.clone();
-        let broadcast_rx_clone = broadcast_tx.subscribe();
-        let server_tx_clone = server_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(
-                socket,
-                addr,
-                players_hash_clone,
-                num_players_clone,
-                num_votes_clone,
-                broadcast_rx_clone,
-                server_tx_clone
-            ).await {
-                eprintln!("Error with client {}: {}", addr, e);
+        if let Ok(msg) = server_rx.try_recv() {
+            if let Err(_) = match msg {
+                ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes) =>
+                    broadcast_tx.send(ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes)),
+                ClientMessage::AcceptClient(p_name) =>
+                    broadcast_tx.send(ClientMessage::AcceptClient(p_name)),
+                ClientMessage::PlayerLeft(p_name) =>
+                    broadcast_tx.send(ClientMessage::PlayerLeft(p_name)),
+                ClientMessage::Kick(p_name) =>
+                    broadcast_tx.send(ClientMessage::Kick(p_name)),
+                ClientMessage::TimeOutClient(p_name) =>
+                    broadcast_tx.send(ClientMessage::TimeOutClient(p_name)),
+                _ => Ok(0),
+            } {
+                eprintln!("Failed to send broadcast");
             }
-        });
-
-        let n_players = num_players.load(Ordering::SeqCst);
-        let n_votes = num_votes.load(Ordering::SeqCst);
-
-        if n_players > 0 && n_players == n_votes {
-            println!("Starting game with {} players", n_players);
-            break;
         }
+        let timeout_result = timeout(Duration::from_millis(50), listener.accept()).await;
+        let new_client = match timeout_result {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        match new_client {
+            Ok((socket, addr)) => {
+                println!("New connection from: {}", addr);
+
+                let players_hash_clone = players_hash.clone();
+                let num_players_clone = num_players.clone();
+                let num_votes_clone = num_votes.clone();
+                let broadcast_rx_clone = broadcast_tx.subscribe();
+                let server_tx_clone = server_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client(
+                        socket,
+                        addr,
+                        players_hash_clone,
+                        num_players_clone,
+                        num_votes_clone,
+                        broadcast_rx_clone,
+                        server_tx_clone
+                    ).await {
+                        eprintln!("Error with client {}: {}", addr, e);
+                    }
+                });
+            },
+            Err(_) => {}
+        }
+        // let n_players = num_players.load(Ordering::SeqCst);
+        // let n_votes = num_votes.load(Ordering::SeqCst);
+        //
+        // if n_players > 0 && n_players == n_votes {
+        //     println!("Starting game with {} players", n_players);
+        //     break;
+        // }
     }
 
     // loop {
@@ -409,9 +480,8 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
     // Read data from the socket
     let timeout_result = timeout(Duration::from_secs(5), deserialize_message(&mut stream)).await;
     let result: Result<ClientMessage, LiarsDiceError> = match timeout_result {
-        Ok(Ok(message)) => Ok(message.unwrap()), // Success
-        Ok(Err(e)) => Err(e),          // Deserialization or reading error
-        Err(_) => {
+        Ok(Ok(message)) => Ok(message.unwrap()),
+        Err(_) | Ok(Err(_)) => {
             // Timeout occurred
             return Err(LiarsDiceError::TimeoutError)
         }
@@ -437,52 +507,79 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
 
     println!("Press 'q' to exit");
     println!("Start game? (y/n)");
+    let mut vote = false;
     // Lobby loop
     loop {
         // Poll for an event (non-blocking, with a timeout)
         if event::poll(Duration::from_millis(1))? {
-            if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
-                // Check if the key was already pressed
-                if !pressed_keys.contains(&code) {
-                    continue
-                }
-                pressed_keys.insert(code);
+            if let Event::Key(KeyEvent { code, modifiers, kind, .. }) = event::read()? {
+                match kind {
+                    // Handle key press
+                    KeyEventKind::Press => {
+                        if !pressed_keys.contains(&code) {
+                            pressed_keys.insert(code);
 
-                // Key press logic
-                match code {
-                    KeyCode::Char('q') if modifiers.is_empty() => {
-                        stream.write_all(serialize_message(&StartMessage::Exit).as_slice()).await?;
-                        println!("'q' pressed. Exiting...");
-                        break;
-                    },
-                    KeyCode::Char('y') => {
-                        stream.write_all(serialize_message(&StartMessage::VoteStart(true)).as_slice()).await?;
-                    },
-                    KeyCode::Char('n') => {
-                        stream.write_all(serialize_message(&StartMessage::VoteStart(false)).as_slice()).await?;
-                    },
-                    _ => {
-                        println!("Other key pressed: {:?}", code);
+                            // Key press logic
+                            match code {
+                                KeyCode::Char('q') if modifiers.is_empty() => {
+                                    stream
+                                        .write_all(serialize_message(&StartMessage::Exit).as_slice())
+                                        .await?;
+                                    stream.flush().await?;
+                                    break;
+                                }
+                                KeyCode::Char('y') => {
+                                    if vote {
+                                        continue
+                                    }
+                                    vote = true;
+                                    stream
+                                        .write_all(
+                                            serialize_message(&StartMessage::VoteStart(true))
+                                                .as_slice(),
+                                        )
+                                        .await?;
+                                }
+                                KeyCode::Char('n') => {
+                                    if !vote {
+                                        continue
+                                    }
+                                    vote = false;
+                                    stream
+                                        .write_all(
+                                            serialize_message(&StartMessage::VoteStart(false))
+                                                .as_slice(),
+                                        )
+                                        .await?;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
+                    // Handle key release
+                    KeyEventKind::Release => {
+                        pressed_keys.remove(&code);
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Check for released keys
-        let released_keys: Vec<KeyCode> = pressed_keys
-            .iter()
-            .filter(|key| !event::poll(Duration::from_millis(0)).unwrap_or(false))
-            .cloned()
-            .collect();
-
-        for key in released_keys {
-            pressed_keys.remove(&key);
-        }
-
-        let timeout_result: Result<Result<Option<ClientMessage>, LiarsDiceError>, _> = timeout(Duration::from_millis(10), deserialize_message(&mut stream)).await;
+        let timeout_result: Result<Result<Option<ClientMessage>, LiarsDiceError>, _> =
+            timeout(Duration::from_millis(20), deserialize_message::<ClientMessage>(&mut stream)).await;
 
         // Test connection
         let message = match timeout_result {
+            Ok(n) => {
+                if retries > 0 {
+                    retries = 0;
+                    println!("Connection with server re-established!");
+                }
+                n
+            },
+            Err(_) => continue,
+        };
+        let client_option = match message {
             Ok(n) => {
                 if retries > 0 {
                     println!("Connection with server re-established!");
@@ -490,20 +587,22 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                 }
                 n
             },
-            Err(_) => continue,
-        };
-        let client_message: ClientMessage = match message {
-            Ok(x) => x.unwrap(),
-            Err(_) => {
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
                 retries += 1;
                 println!("{}'s connection lost. Retrying... ({}/{})", name, retries, MAX_RETRIES);
                 if retries >= MAX_RETRIES {
-                    println!("Max retries reached. Disconnecting client.");
+                    println!("Max retries reached. Shutting down...");
                     return Err(LiarsDiceError::TimeoutError);
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 continue;
             },
+        };
+
+        let client_message = match client_option {
+            Some(x) => x,
+            None => continue,
         };
 
         // Read message content
