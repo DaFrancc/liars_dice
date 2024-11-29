@@ -48,7 +48,8 @@ enum ServerMessage {
 /// Types of messages server will send to client
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum ClientMessage {
-    /// Contains shuffled die of player
+    DiceReady,
+    /// Indicates that player's die have been shuffled and are ready
     ShuffleResult(Vec<u8>),
     /// Contains optional die info of every player
     SendAll(Vec<PlayerSerialize>),
@@ -261,125 +262,146 @@ async fn handle_client(
     let mut retries = 0;
     const MAX_RETRIES: usize = 5;
 
-    // Lobby loop
-    loop {
-        if let Ok(msg) = broadcast_rx.try_recv() {
-            let serialized: Result<ClientMessage, LiarsDiceError> = match msg {
-                ClientMessage::StartGame => Ok(ClientMessage::StartGame),
-                ClientMessage::PlayerLeft(p_name) => Ok(ClientMessage::PlayerLeft(p_name)),
-                ClientMessage::AcceptClient(p_name) => Ok(ClientMessage::AcceptClient(p_name)),
-                ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) =>
-                    Ok(ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players)),
-                ClientMessage::Kick(p_name) => Ok(ClientMessage::Kick(p_name)),
-                _ => Err(LiarsDiceError::Other(String::from("Unknown message type"))),
-            };
-            match serialized {
-                Ok(serialized) => {
-                    let mut players = players_hash.lock().await;
-                    let player = match players.get_mut(&addr) {
-                        Some(p) => p,
-                        None => {
-                            return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
+    'super_loop: loop {
+        let name = {
+            let mut players = players_hash.lock().await;
+            let player = players.get_mut(&addr).unwrap();
+            player.name.clone()
+        };
+        // Lobby loop
+        'lobby_loop: loop {
+            if let Ok(msg) = broadcast_rx.try_recv() {
+                let serialized: Result<ClientMessage, LiarsDiceError> = match msg {
+                    ClientMessage::StartGame => Ok(ClientMessage::StartGame),
+                    ClientMessage::PlayerLeft(p_name) => Ok(ClientMessage::PlayerLeft(p_name)),
+                    ClientMessage::AcceptClient(p_name) => Ok(ClientMessage::AcceptClient(p_name)),
+                    ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) =>
+                        Ok(ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players)),
+                    ClientMessage::Kick(p_name) => Ok(ClientMessage::Kick(p_name)),
+                    _ => Err(LiarsDiceError::Other(String::from("Unknown message type"))),
+                };
+                match serialized {
+                    Ok(s) => {
+                        let mut players = players_hash.lock().await;
+                        let player = match players.get_mut(&addr) {
+                            Some(p) => p,
+                            None => {
+                                return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
+                            },
+                        };
+                        player.stream.write_all(serialize_message(&s).as_slice()).await?;
+                        player.stream.flush().await?;
+
+                        match s {
+                            ClientMessage::Kick(p_name) if p_name == name => {
+                                return Err(LiarsDiceError::Other(String::from("Player kicked")));
+                            },
+                            ClientMessage::StartGame => {
+                                break 'lobby_loop;
+                            },
+                            _ => {},
                         }
-                    };
-                    player.stream.write_all(serialize_message(&serialized).as_slice()).await?;
-                    player.stream.flush().await?;
+                    }
+                    Err(_) => eprintln!("Failed to send message to client"),
                 }
-                Err(_) => eprintln!("Failed to send message to client"),
+            }
+            // Take stream and clone name without holding onto the lock
+            let timeout_result = {
+                let mut players = players_hash.lock().await;
+                let player = players.get_mut(&addr).unwrap();
+
+                timeout(Duration::from_millis(20), deserialize_message(&mut player.stream)).await
+            };
+            // Test connection
+            let message_received: Result<Option<StartMessage>, LiarsDiceError> = timeout_result.unwrap_or_else(|_| Ok(None));
+            let message_option = match message_received {
+                Ok(n) => {
+                    if retries > 0 {
+                        retries = 0;
+                        println!("{}'s connection re-established!", name);
+                    }
+                    n
+                },
+                Err(_) => {
+                    retries += 1;
+                    println!("{}'s connection lost. Retrying... ({}/{})", name, retries, MAX_RETRIES);
+                    if retries >= MAX_RETRIES {
+                        println!("Max retries reached. Disconnecting client.");
+                        println!("{} left", name);
+                        let mut players = players_hash.lock().await;
+                        players.shift_remove(&addr);
+                        num_players.fetch_sub(1, Ordering::SeqCst);
+                        return Err(LiarsDiceError::TimeoutError);
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                },
+            };
+            let message = match message_option {
+                Some(m) => m,
+                None => continue,
+            };
+            {
+                let mut players = players_hash.lock().await;
+                let player = match players.get_mut(&addr) {
+                    Some(p) => p,
+                    None => {
+                        return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
+                    }
+                };
+                // Read message content
+                match message {
+                    StartMessage::VoteStart(vote) => {
+                        if vote == player.start_game {
+                            continue
+                        } else if vote && !player.start_game {
+                            num_votes.fetch_add(1, Ordering::SeqCst);
+                        } else if !vote && player.start_game {
+                            num_votes.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        player.start_game = vote;
+                        let n_votes = num_votes.load(Ordering::SeqCst);
+                        let n_people = num_players.load(Ordering::SeqCst);
+
+                        if let Err(_) = mpsc_tx.send(ClientMessage::VoteStart(player.name.clone(), vote, n_votes as u8, n_people as u8)).await {
+                            eprintln!("Failed to send message to server");
+                        }
+
+                        print!("{} voted ", player.name);
+                        if vote {
+                            print!("{}", style("YES").with(Color::Green).attribute(Attribute::Bold).attribute(Attribute::Underlined));
+                        } else {
+                            print!("{}", style("NO").with(Color::Red).attribute(Attribute::Bold).attribute(Attribute::Underlined));
+                        }
+                        println!(" to start game ({}/{})", n_votes, n_people);
+                    }
+                    StartMessage::Exit => {
+                        if let Err(_) = mpsc_tx.send(ClientMessage::PlayerLeft(player.name.clone())).await {
+                            eprintln!("Failed to send message to server");
+                        }
+                        println!("{} left", player.name);
+                        num_players.fetch_sub(1, Ordering::SeqCst);
+                        if player.start_game {
+                            num_votes.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        players.shift_remove(&addr);
+                        return Ok(())
+                    }
+                    _ => continue,
+                }
             }
         }
-        // Take stream and clone name without holding onto the lock
-        let timeout_result;
-        let name;
-        {
-            let mut players = players_hash.lock().await;
-            let player = match players.get_mut(&addr) {
-                Some(p) => p,
-                None => {
-                    return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
+        'game_loop: loop {
+            let broadcast_result = broadcast_rx.try_recv();
+            if let Ok(b) = broadcast_result {
+                match b {
+                    ClientMessage::DiceReady => {
+                        let mut players = players_hash.lock().await;
+                        let player = players.get_mut(&addr).unwrap();
+                        player.stream.write_all(serialize_message(&ClientMessage::ShuffleResult(player.die.clone())).as_slice()).await?;
+                    },
+                    todo!()
                 }
-            };
-            name = player.name.clone();
-
-            timeout_result = timeout(Duration::from_millis(20), deserialize_message(&mut player.stream)).await;
-        }
-        // Test connection
-        let message_received: Result<Option<StartMessage>, LiarsDiceError> = timeout_result.unwrap_or_else(|_| Ok(None));
-        let message_option = match message_received {
-            Ok(n) => {
-                if retries > 0 {
-                    retries = 0;
-                    println!("{}'s connection re-established!", name);
-                }
-                n
-            },
-            Err(_) => {
-                retries += 1;
-                println!("{}'s connection lost. Retrying... ({}/{})", name, retries, MAX_RETRIES);
-                if retries >= MAX_RETRIES {
-                    println!("Max retries reached. Disconnecting client.");
-                    println!("{} left", name);
-                    let mut players = players_hash.lock().await;
-                    players.shift_remove(&addr);
-                    num_players.fetch_sub(1, Ordering::SeqCst);
-                    return Err(LiarsDiceError::TimeoutError);
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                continue;
-            },
-        };
-        let message = match message_option {
-            Some(m) => m,
-            None => continue,
-        };
-        {
-            let mut players = players_hash.lock().await;
-            let player = match players.get_mut(&addr) {
-                Some(p) => p,
-                None => {
-                    return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
-                }
-            };
-            // Read message content
-            match message {
-                StartMessage::VoteStart(vote) => {
-                    if vote == player.start_game {
-                        continue
-                    }
-                    else if vote && !player.start_game {
-                        num_votes.fetch_add(1, Ordering::SeqCst);
-                    } else if !vote && player.start_game {
-                        num_votes.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    player.start_game = vote;
-                    let n_votes = num_votes.load(Ordering::SeqCst);
-                    let n_people = num_players.load(Ordering::SeqCst);
-
-                    if let Err(_) = mpsc_tx.send(ClientMessage::VoteStart(player.name.clone(), vote, n_votes as u8, n_people as u8)).await {
-                        eprintln!("Failed to send message to server");
-                    }
-
-                    print!("{} voted ", player.name);
-                    if vote {
-                        print!("{}", style("YES").with(Color::Green).attribute(Attribute::Bold).attribute(Attribute::Underlined));
-                    } else {
-                        print!("{}", style("NO").with(Color::Red).attribute(Attribute::Bold).attribute(Attribute::Underlined));
-                    }
-                    println!(" to start game ({}/{})", n_votes, n_people);
-                }
-                StartMessage::Exit => {
-                    if let Err(_) = mpsc_tx.send(ClientMessage::PlayerLeft(player.name.clone())).await {
-                        eprintln!("Failed to send message to server");
-                    }
-                    println!("{} left", player.name);
-                    num_players.fetch_sub(1, Ordering::SeqCst);
-                    if player.start_game {
-                        num_votes.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    players.shift_remove(&addr);
-                    return Ok(())
-                }
-                _ => continue,
             }
         }
     }
@@ -399,10 +421,10 @@ async fn run_server() -> Result<(), LiarsDiceError> {
     let num_players_atomic = Arc::new(AtomicUsize::new(0usize));
     let num_votes_atomic = Arc::new(AtomicUsize::new(0usize));
     // Create a broadcast channel for server-to-clients communication
-    let (broadcast_tx, _) = broadcast::channel(16);
+    let (broadcast_tx, _) = broadcast::channel(32);
 
     // Create an mpsc channel for clients-to-server communication
-    let (server_tx, mut server_rx): (Sender<ClientMessage>, mpsc::Receiver<ClientMessage>) = mpsc::channel(16);
+    let (server_tx, mut server_rx): (Sender<ClientMessage>, mpsc::Receiver<ClientMessage>) = mpsc::channel(32);
 
     'super_loop: loop {
         // Lobby loop
@@ -427,7 +449,7 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                     if let Err(_) = broadcast_tx.send(ClientMessage::StartGame) {
                         eprintln!("Failed to send start broadcast");
                     }
-                    break;
+                    break 'lobby_loop;
                 }
             }
             let timeout_result = timeout(Duration::from_millis(50), listener.accept()).await;
@@ -473,7 +495,7 @@ async fn run_server() -> Result<(), LiarsDiceError> {
         // Game loop
         'game_loop: loop {
             // Set up game
-            let mut cur_player_turn = { // Drop lock at end of scope
+            let mut cur_player_turn = { // Acquire lock
                 let mut players = players_hash.lock().await;
                 let mut rng = rand::thread_rng();
                 let dist = Uniform::from(1u8..=6u8);
@@ -484,6 +506,9 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                 }
                 Uniform::from(0u8..=players.len() as u8).sample(&mut rng) as usize
             }; // Drop lock
+            if let Err(_) = broadcast_tx.send(ClientMessage::DiceReady) {
+                eprintln!("Failed to send broadcast");
+            }
             let mut prev_player_turn: usize = 0;
             let mut remaining_players = num_players_atomic.load(Ordering::SeqCst);
             let mut first_turn = true;
@@ -497,6 +522,9 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                     {
                         eprintln!("Failed to send broadcast");
                     }
+                    break 'game_loop;
+                }
+                else if remaining_players == 0 {
                     break 'game_loop;
                 }
                 prev_player_turn = cur_player_turn;
@@ -570,7 +598,7 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                                 }
                             } // Drop lock
                             if cur_wager.1 < all_die[cur_wager.0 as usize] {
-                                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerLostDie(prev_player_name))
+                                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerLostDie(prev_player_name.clone()))
                                 {
                                     eprintln!("Failed to send broadcast");
                                 }
