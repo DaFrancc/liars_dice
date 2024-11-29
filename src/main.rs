@@ -4,15 +4,18 @@ use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc::Sender;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::style::{style, Attribute, Color, Stylize};
+use indexmap::IndexMap;
+use rand::distributions::Uniform;
+use rand::distributions::Distribution;
 use serde::de::DeserializeOwned;
 
 const DIE_FACES: [[&str; 5]; 6] = [
@@ -46,15 +49,23 @@ enum ServerMessage {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum ClientMessage {
     /// Contains shuffled die of player
-    ShuffleResult(Vec<i8>),
+    ShuffleResult(Vec<u8>),
     /// Contains optional die info of every player
     SendAll(Vec<PlayerSerialize>),
     /// Information of a player's wager
-    Wager(String, i8, i8),
+    Wager(String, u8, u8),
     /// Information of a player calling a bluff
     CallLiar(String),
     /// Information of a player calling exact guess
     CallExact(String),
+    /// Information that a player correctly guessed exact die count
+    ExactCallCorrect(String),
+    /// Information that a player has lost all of his dice and can no longer play
+    PlayerBustedOut(String),
+    /// Information that a player has lost a die
+    PlayerLostDie(String),
+    /// Information that a player has won
+    PlayerWon(String),
     /// Information of a player leaving the game
     PlayerLeft(String),
     /// Information that game started
@@ -75,7 +86,7 @@ enum ClientMessage {
 
 struct PlayerInfo {
     name: String,
-    die: Vec<i8>,
+    die: Vec<u8>,
     start_game: bool,
     stream: TcpStream,
 }
@@ -118,7 +129,7 @@ impl From<serde_json::Error> for LiarsDiceError {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct PlayerSerialize {
     name: String,
-    die: Option<Vec<i8>>,
+    die: Option<Vec<u8>>,
 }
 
 fn print_die_faces(arr: &[usize; 5]) {
@@ -159,7 +170,7 @@ async fn deserialize_message<T: DeserializeOwned>(
         Ok(0) => {
             return Err(LiarsDiceError::IoError(format!("Read 0 bytes but expected {length} bytes")));
         }
-        Ok(n) => {},
+        Ok(_) => {},
     }
     match serde_json::from_slice::<T>(&buffer[..length]) {
         Ok(message) => Ok(Some(message)),
@@ -167,7 +178,7 @@ async fn deserialize_message<T: DeserializeOwned>(
     }
 }
 
-async fn serialize_players(players_hash: Arc<AsyncMutex<HashMap<SocketAddr, PlayerInfo>>>, include_die: bool) -> Vec<PlayerSerialize> {
+async fn serialize_players(players_hash: Arc<AsyncMutex<IndexMap<SocketAddr, PlayerInfo>>>, include_die: bool) -> Vec<PlayerSerialize> {
     let mut players = players_hash.lock().await;
     let mut v = Vec::new();
     for player in players.values_mut() {
@@ -183,7 +194,7 @@ async fn serialize_players(players_hash: Arc<AsyncMutex<HashMap<SocketAddr, Play
 async fn client_join(
     mut socket: TcpStream,
     addr: SocketAddr,
-    players_hash: Arc<AsyncMutex<HashMap<SocketAddr, PlayerInfo>>>,
+    players_hash: Arc<AsyncMutex<IndexMap<SocketAddr, PlayerInfo>>>,
     num_players: Arc<AtomicUsize>
 ) -> Result<(), LiarsDiceError>
 {
@@ -222,13 +233,13 @@ async fn client_join(
 }
 
 async fn handle_client(
-    mut socket: TcpStream,
+    socket: TcpStream,
     addr: SocketAddr,
-    players_hash: Arc<AsyncMutex<HashMap<SocketAddr, PlayerInfo>>>,
+    players_hash: Arc<AsyncMutex<IndexMap<SocketAddr, PlayerInfo>>>,
     num_players: Arc<AtomicUsize>,
     num_votes: Arc<AtomicUsize>,
     mut broadcast_rx: Receiver<ClientMessage>,
-    mut mpsc_tx: Sender<ClientMessage>
+    mpsc_tx: Sender<ClientMessage>
 )
     -> Result<(), LiarsDiceError> {
     // Read data from the socket
@@ -309,7 +320,7 @@ async fn handle_client(
                     println!("Max retries reached. Disconnecting client.");
                     println!("{} left", name);
                     let mut players = players_hash.lock().await;
-                    players.remove(&addr);
+                    players.shift_remove(&addr);
                     num_players.fetch_sub(1, Ordering::SeqCst);
                     return Err(LiarsDiceError::TimeoutError);
                 }
@@ -365,7 +376,7 @@ async fn handle_client(
                     if player.start_game {
                         num_votes.fetch_sub(1, Ordering::SeqCst);
                     }
-                    players.remove(&addr);
+                    players.shift_remove(&addr);
                     return Ok(())
                 }
                 _ => continue,
@@ -378,52 +389,58 @@ async fn handle_client(
 async fn run_server() -> Result<(), LiarsDiceError> {
     let listener = match TcpListener::bind("0.0.0.0:6969").await {
         Ok(x) => x,
-        Err(e) => {
+        Err(_e) => {
             return Err(LiarsDiceError::Other(String::from("Failed to bind socket")));
         },
     };
 
     // These can't be atomicusize, change to asyncmutex. I forgot why these can't be lmao
-    let players_hash: Arc<AsyncMutex<HashMap<SocketAddr, PlayerInfo>>> = Arc::new(AsyncMutex::new(HashMap::new()));
-    let num_players = Arc::new(AtomicUsize::new(0usize));
-    let num_votes = Arc::new(AtomicUsize::new(0usize));
+    let players_hash: Arc<AsyncMutex<IndexMap<SocketAddr, PlayerInfo>>> = Arc::new(AsyncMutex::new(IndexMap::new()));
+    let num_players_atomic = Arc::new(AtomicUsize::new(0usize));
+    let num_votes_atomic = Arc::new(AtomicUsize::new(0usize));
     // Create a broadcast channel for server-to-clients communication
     let (broadcast_tx, _) = broadcast::channel(16);
 
     // Create an mpsc channel for clients-to-server communication
     let (server_tx, mut server_rx): (Sender<ClientMessage>, mpsc::Receiver<ClientMessage>) = mpsc::channel(16);
 
-    // Lobby loop
-    loop {
-        if let Ok(msg) = server_rx.try_recv() {
-            if let Err(_) = match msg {
-                ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) =>
-                    broadcast_tx.send(ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players)),
-                ClientMessage::AcceptClient(p_name) =>
-                    broadcast_tx.send(ClientMessage::AcceptClient(p_name)),
-                ClientMessage::PlayerLeft(p_name) =>
-                    broadcast_tx.send(ClientMessage::PlayerLeft(p_name)),
-                ClientMessage::Kick(p_name) =>
-                    broadcast_tx.send(ClientMessage::Kick(p_name)),
-                ClientMessage::TimeOutClient(p_name) =>
-                    broadcast_tx.send(ClientMessage::TimeOutClient(p_name)),
-                _ => Ok(0),
-            } {
-                eprintln!("Failed to send broadcast");
+    'super_loop: loop {
+        // Lobby loop
+        'lobby_loop: loop {
+            if let Ok(msg) = server_rx.try_recv() {
+                if let Err(_) = match msg {
+                    ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) =>
+                        broadcast_tx.send(ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players)),
+                    ClientMessage::AcceptClient(p_name) =>
+                        broadcast_tx.send(ClientMessage::AcceptClient(p_name)),
+                    ClientMessage::PlayerLeft(p_name) =>
+                        broadcast_tx.send(ClientMessage::PlayerLeft(p_name)),
+                    ClientMessage::Kick(p_name) =>
+                        broadcast_tx.send(ClientMessage::Kick(p_name)),
+                    ClientMessage::TimeOutClient(p_name) =>
+                        broadcast_tx.send(ClientMessage::TimeOutClient(p_name)),
+                    _ => Ok(0),
+                } {
+                    eprintln!("Failed to send broadcast");
+                }
+                if num_players_atomic.load(Ordering::SeqCst) == num_votes_atomic.load(Ordering::SeqCst) {
+                    if let Err(_) = broadcast_tx.send(ClientMessage::StartGame) {
+                        eprintln!("Failed to send start broadcast");
+                    }
+                    break;
+                }
             }
-        }
-        let timeout_result = timeout(Duration::from_millis(50), listener.accept()).await;
-        let new_client = match timeout_result {
-            Ok(x) => x,
-            Err(_) => continue,
-        };
-        match new_client {
-            Ok((socket, addr)) => {
+            let timeout_result = timeout(Duration::from_millis(50), listener.accept()).await;
+            let new_client = match timeout_result {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            if let Ok((socket, addr)) = new_client {
                 println!("New connection from: {}", addr);
 
                 let players_hash_clone = players_hash.clone();
-                let num_players_clone = num_players.clone();
-                let num_votes_clone = num_votes.clone();
+                let num_players_clone = num_players_atomic.clone();
+                let num_votes_clone = num_votes_atomic.clone();
                 let broadcast_rx_clone = broadcast_tx.subscribe();
                 let server_tx_clone = server_tx.clone();
                 tokio::spawn(async move {
@@ -439,21 +456,193 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                         eprintln!("Error with client {}: {}", addr, e);
                     }
                 });
-            },
-            Err(_) => {}
+            }
         }
-        // let n_players = num_players.load(Ordering::SeqCst);
-        // let n_votes = num_votes.load(Ordering::SeqCst);
-        //
-        // if n_players > 0 && n_players == n_votes {
-        //     println!("Starting game with {} players", n_players);
-        //     break;
-        // }
-    }
 
-    // loop {
-    //
-    // }
+        { // Acquire players lock
+            let mut players = players_hash.lock().await;
+            for player in players.values_mut() {
+                for _ in 0..6 {
+                    player.die.push(0);
+                }
+            }
+        } // Drop lock
+
+        let keys = players_hash.lock().await.keys().cloned().collect::<Vec<_>>();
+
+        // Game loop
+        'game_loop: loop {
+            // Set up game
+            let mut cur_player_turn = { // Drop lock at end of scope
+                let mut players = players_hash.lock().await;
+                let mut rng = rand::thread_rng();
+                let dist = Uniform::from(1u8..=6u8);
+                for player in players.values_mut() {
+                    for die in player.die.iter_mut() {
+                        *die = dist.sample(&mut rng);
+                    }
+                }
+                Uniform::from(0u8..=players.len() as u8).sample(&mut rng) as usize
+            }; // Drop lock
+            let mut prev_player_turn: usize = 0;
+            let mut remaining_players = num_players_atomic.load(Ordering::SeqCst);
+            let mut first_turn = true;
+            let mut prev_player_name: String = String::from("");
+            let mut cur_player_name: String = String::from("");
+            let mut cur_wager: (u8, u8) = (0, 0); // (face, quantity)
+            // Turn loop
+            'turn_loop: loop {
+                if remaining_players == 1 {
+                    if let Err(_) = broadcast_tx.send(ClientMessage::PlayerWon(cur_player_name.clone()))
+                    {
+                        eprintln!("Failed to send broadcast");
+                    }
+                    break 'game_loop;
+                }
+                prev_player_turn = cur_player_turn;
+                cur_player_turn = (cur_player_turn + 1) % num_players_atomic.load(Ordering::SeqCst);
+                prev_player_name = cur_player_name;
+                { // Acquire players lock
+                    cur_player_name = players_hash
+                        .lock()
+                        .await
+                        .get(&keys[cur_player_turn])
+                        .unwrap()
+                        .name
+                        .clone();
+                } // Drop lock
+                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerTurn(cur_player_name.clone()))
+                {
+                    eprintln!("Failed to send broadcast");
+                }
+                let time_left = Duration::from_secs(30);
+                'await_response: loop {
+                    let start_time = Instant::now();
+                    let timeout_result = timeout(time_left, server_rx.recv()).await;
+                    let elapsed = start_time.elapsed();
+                    let _ = time_left.checked_sub(elapsed);
+                    let message = match timeout_result {
+                        Ok(x) => x.unwrap(),
+                        Err(_) => {
+                            if let Err(_) = broadcast_tx.send(ClientMessage::TimeOutClient(cur_player_name.clone()))
+                            {
+                                eprintln!("Failed to send broadcast");
+                            }
+                            let mut players = players_hash.lock().await;
+                            let player = players.get_mut(&keys[cur_player_turn]).unwrap();
+                            player.die.pop();
+                            if player.die.is_empty() {
+                                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerBustedOut(cur_player_name.clone()))
+                                {
+                                    eprintln!("Failed to send broadcast");
+                                }
+                            }
+                            prev_player_name = cur_player_name;
+                            break 'turn_loop;
+                        },
+                    };
+                    match message {
+                        ClientMessage::Wager(p_name, die_face, die_quantity) if p_name == cur_player_name => {
+                            if let Err(_) = broadcast_tx.send(ClientMessage::Wager(p_name, die_face, die_quantity))
+                            {
+                                eprintln!("Failed to send broadcast");
+                            }
+                            cur_wager = (die_face, die_quantity);
+                            first_turn = false;
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            break;
+                        },
+                        ClientMessage::CallLiar(p_name) if p_name == cur_player_name && !first_turn => {
+                            if let Err(_) = broadcast_tx.send(ClientMessage::CallLiar(p_name.clone()))
+                            {
+                                eprintln!("Failed to send broadcast");
+                            }
+                            first_turn = false;
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            // Count up total dies
+                            let mut all_die: [u8; 6] = [0; 6];
+                            { // Acquire lock
+                                let mut players = players_hash.lock().await;
+                                for player in players.values_mut() {
+                                    for die in player.die.iter_mut() {
+                                        all_die[(*die-1) as usize] += 1;
+                                    }
+                                }
+                            } // Drop lock
+                            if cur_wager.1 < all_die[cur_wager.0 as usize] {
+                                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerLostDie(prev_player_name))
+                                {
+                                    eprintln!("Failed to send broadcast");
+                                }
+                                let mut players = players_hash.lock().await;
+                                let player = players
+                                    .get_mut(&keys[prev_player_turn])
+                                    .unwrap();
+                                player.die.pop();
+                                if player.die.is_empty() {
+                                    remaining_players -= 1;
+                                }
+                            } else {
+                                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerLostDie(p_name.clone()))
+                                {
+                                    eprintln!("Failed to send broadcast");
+                                }
+                                let mut players = players_hash.lock().await;
+                                let player = players
+                                    .get_mut(&keys[prev_player_turn])
+                                    .unwrap();
+                                player.die.pop();
+                                if player.die.is_empty() {
+                                    remaining_players -= 1;
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            break;
+                        },
+                        ClientMessage::CallExact(p_name) if p_name == cur_player_name && !first_turn => {
+                            if let Err(_) = broadcast_tx.send(ClientMessage::CallExact(p_name.clone()))
+                            {
+                                eprintln!("Failed to send broadcast");
+                            }
+                            first_turn = false;
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            // Count up total dies
+                            let mut all_die: [u8; 6] = [0; 6];
+                            { // Acquire lock
+                                let mut players = players_hash.lock().await;
+                                for player in players.values_mut() {
+                                    for die in player.die.iter_mut() {
+                                        all_die[(*die-1) as usize] += 1;
+                                    }
+                                }
+                            } // Drop lock
+                            if cur_wager.1 == all_die[cur_wager.0 as usize] {
+                                if let Err(_) = broadcast_tx.send(ClientMessage::ExactCallCorrect(p_name.clone()))
+                                {
+                                    eprintln!("Failed to send broadcast");
+                                }
+                            } else {
+                                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerLostDie(p_name.clone()))
+                                {
+                                    eprintln!("Failed to send broadcast");
+                                    let mut players = players_hash.lock().await;
+                                    let player = players
+                                        .get_mut(&keys[cur_player_turn])
+                                        .unwrap();
+                                    player.die.pop();
+                                    if player.die.is_empty() {
+                                        remaining_players -= 1;
+                                    }
+                                }
+                            }
+                            break;
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
