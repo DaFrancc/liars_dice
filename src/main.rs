@@ -639,20 +639,20 @@ async fn main() {
     println!("{ip}");
 
     if ip == "host" {
-        let task = Some(tokio::spawn(async {
+        let task = tokio::spawn(async {
             if let Err(e) = run_server().await {
                 eprintln!("Server error: {}", e);
             }
-        }));
-        task.await;
+        });
+        let _ = task.await;
     } else {
         let ip_clone = ip.clone();
-        let task = Some(tokio::spawn(async {
+        let task = tokio::spawn(async {
             if let Err(e) = run_client(ip_clone).await {
                 eprintln!("Client error: {}", e);
             }
-        }));
-        task.await;
+        });
+        let _ = task.await;
     }
 
     println!("Press Enter to exit program");
