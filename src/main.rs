@@ -636,33 +636,23 @@ async fn main() {
         2 => args[1].clone().trim().parse().unwrap(),
         _ => return
     };
+    println!("{ip}");
 
-    let server_task = if ip == "host" {
-        Some(tokio::spawn(async {
+    if ip == "host" {
+        let task = Some(tokio::spawn(async {
             if let Err(e) = run_server().await {
                 eprintln!("Server error: {}", e);
             }
-        }))
+        }));
+        task.await;
     } else {
-        None
-    };
-
-    let client_task = if ip == "host" {
         let ip_clone = ip.clone();
-        Some(tokio::spawn(async {
+        let task = Some(tokio::spawn(async {
             if let Err(e) = run_client(ip_clone).await {
                 eprintln!("Client error: {}", e);
             }
-        }))
-    } else {
-        None
-    };
-
-    if ip == "host" {
-        server_task.unwrap().await.unwrap();
-    } else {
-        // Only run the client task if no server is started
-        client_task.unwrap().await.unwrap();
+        }));
+        task.await;
     }
 
     println!("Press Enter to exit program");
