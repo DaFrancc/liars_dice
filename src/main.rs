@@ -1,21 +1,19 @@
-use std::{fmt, io};
+use std::{env, fmt, io};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use serde::ser::Error;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::time::timeout;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::style::{style, Attribute, Color, SetForegroundColor, Stylize};
+use crossterm::style::{style, Attribute, Color, Stylize};
 use serde::de::DeserializeOwned;
-use tokio::time::error::Elapsed;
 
 const DIE_FACES: [[&str; 5]; 6] = [
     ["---------", "|       |", "|   *   |", "|       |", "---------"],
@@ -259,8 +257,8 @@ async fn handle_client(
                 ClientMessage::StartGame => Ok(ClientMessage::StartGame),
                 ClientMessage::PlayerLeft(p_name) => Ok(ClientMessage::PlayerLeft(p_name)),
                 ClientMessage::AcceptClient(p_name) => Ok(ClientMessage::AcceptClient(p_name)),
-                ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes) =>
-                    Ok(ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes)),
+                ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) =>
+                    Ok(ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players)),
                 ClientMessage::Kick(p_name) => Ok(ClientMessage::Kick(p_name)),
                 _ => Err(LiarsDiceError::Other(String::from("Unknown message type"))),
             };
@@ -274,6 +272,7 @@ async fn handle_client(
                         }
                     };
                     player.stream.write_all(serialize_message(&serialized).as_slice()).await?;
+                    player.stream.flush().await?;
                 }
                 Err(_) => eprintln!("Failed to send message to client"),
             }
@@ -294,16 +293,7 @@ async fn handle_client(
             timeout_result = timeout(Duration::from_millis(20), deserialize_message(&mut player.stream)).await;
         }
         // Test connection
-        let message_received: Result<Option<StartMessage>, LiarsDiceError> = match timeout_result {
-            Ok(n) => {
-                if retries > 0 {
-                    retries = 0;
-                    println!("{}'s connection re-established!", name);
-                }
-                n
-            },
-            Err(_) => continue,
-        };
+        let message_received: Result<Option<StartMessage>, LiarsDiceError> = timeout_result.unwrap_or_else(|_| Ok(None));
         let message_option = match message_received {
             Ok(n) => {
                 if retries > 0 {
@@ -351,6 +341,12 @@ async fn handle_client(
                         num_votes.fetch_sub(1, Ordering::SeqCst);
                     }
                     player.start_game = vote;
+                    let n_votes = num_votes.load(Ordering::SeqCst);
+                    let n_people = num_players.load(Ordering::SeqCst);
+
+                    if let Err(_) = mpsc_tx.send(ClientMessage::VoteStart(player.name.clone(), vote, n_votes as u8, n_people as u8)).await {
+                        eprintln!("Failed to send message to server");
+                    }
 
                     print!("{} voted ", player.name);
                     if vote {
@@ -358,9 +354,12 @@ async fn handle_client(
                     } else {
                         print!("{}", style("NO").with(Color::Red).attribute(Attribute::Bold).attribute(Attribute::Underlined));
                     }
-                    println!(" to start game ({}/{})", num_votes.load(Ordering::SeqCst), num_players.load(Ordering::SeqCst));
+                    println!(" to start game ({}/{})", n_votes, n_people);
                 }
                 StartMessage::Exit => {
+                    if let Err(_) = mpsc_tx.send(ClientMessage::PlayerLeft(player.name.clone())).await {
+                        eprintln!("Failed to send message to server");
+                    }
                     println!("{} left", player.name);
                     num_players.fetch_sub(1, Ordering::SeqCst);
                     if player.start_game {
@@ -398,8 +397,8 @@ async fn run_server() -> Result<(), LiarsDiceError> {
     loop {
         if let Ok(msg) = server_rx.try_recv() {
             if let Err(_) = match msg {
-                ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes) =>
-                    broadcast_tx.send(ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes)),
+                ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) =>
+                    broadcast_tx.send(ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players)),
                 ClientMessage::AcceptClient(p_name) =>
                     broadcast_tx.send(ClientMessage::AcceptClient(p_name)),
                 ClientMessage::PlayerLeft(p_name) =>
@@ -492,7 +491,7 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
         ClientMessage::SendAll(p) => {
             println!("Connected as {}!", name);
             // Assign players
-            let players = p; // Assuming players is in scope or further handled
+            players = p;
         }
         ClientMessage::InvalidName => {
             return Err(LiarsDiceError::NameTaken);
@@ -529,28 +528,26 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                                     break;
                                 }
                                 KeyCode::Char('y') => {
-                                    if vote {
-                                        continue
+                                    if !vote {
+                                        vote = true;
+                                        stream
+                                            .write_all(
+                                                serialize_message(&StartMessage::VoteStart(true))
+                                                    .as_slice(),
+                                            )
+                                            .await?;
                                     }
-                                    vote = true;
-                                    stream
-                                        .write_all(
-                                            serialize_message(&StartMessage::VoteStart(true))
-                                                .as_slice(),
-                                        )
-                                        .await?;
                                 }
                                 KeyCode::Char('n') => {
-                                    if !vote {
-                                        continue
+                                    if vote {
+                                        vote = false;
+                                        stream
+                                            .write_all(
+                                                serialize_message(&StartMessage::VoteStart(false))
+                                                    .as_slice(),
+                                            )
+                                            .await?;
                                     }
-                                    vote = false;
-                                    stream
-                                        .write_all(
-                                            serialize_message(&StartMessage::VoteStart(false))
-                                                .as_slice(),
-                                        )
-                                        .await?;
                                 }
                                 _ => {}
                             }
@@ -569,26 +566,17 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
             timeout(Duration::from_millis(20), deserialize_message::<ClientMessage>(&mut stream)).await;
 
         // Test connection
-        let message = match timeout_result {
-            Ok(n) => {
-                if retries > 0 {
-                    retries = 0;
-                    println!("Connection with server re-established!");
-                }
-                n
-            },
-            Err(_) => continue,
-        };
+        let message: Result<Option<ClientMessage>, LiarsDiceError> = timeout_result.unwrap_or_else(|_| Ok(None));
+
         let client_option = match message {
             Ok(n) => {
                 if retries > 0 {
-                    println!("Connection with server re-established!");
                     retries = 0;
+                    println!("Connection with server re-established!");
                 }
                 n
             },
-            Err(e) => {
-                eprintln!("Error: {:?}", e);
+            Err(_) => {
                 retries += 1;
                 println!("{}'s connection lost. Retrying... ({}/{})", name, retries, MAX_RETRIES);
                 if retries >= MAX_RETRIES {
@@ -622,9 +610,14 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                     die: None
                 });
             },
-            ClientMessage::VoteStart(p_name, p_vote, n_players, n_votes) => {
-                println!("{} voted {} to start game ({}/{})", p_name, if p_vote { "YES" } else { "NO" },
-                         n_votes, n_players);
+            ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) => {
+                print!("{} voted ", p_name);
+                if p_vote {
+                    print!("{}", style("YES").with(Color::Green).attribute(Attribute::Bold).attribute(Attribute::Underlined));
+                } else {
+                    print!("{}", style("NO").with(Color::Red).attribute(Attribute::Bold).attribute(Attribute::Underlined));
+                }
+                println!(" to start game ({}/{})", n_votes, n_players);
             },
             ClientMessage::Kick(_) => {
                 return Err(LiarsDiceError::Other(String::from("Kicked")));
@@ -638,20 +631,13 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
 
 #[tokio::main]
 async fn main() {
-    let ip: String = String::from("127.0.0.1:6969");
-    let mut host_choice = String::new();
-    loop {
-        println!("Host or join?");
+    let args: Vec<String> = env::args().collect();
+    let ip: String = match args.len() {
+        2 => args[1].clone().trim().parse().unwrap(),
+        _ => return
+    };
 
-        match io::stdin()
-            .read_line(&mut host_choice) {
-            Ok(_) => break,
-            Err(error) => println!("error: {}\nTry again", error)
-        }
-    }
-    host_choice = host_choice.trim().to_string();
-
-    let server_task = if host_choice == "host" {
+    let server_task = if ip == "host" {
         Some(tokio::spawn(async {
             if let Err(e) = run_server().await {
                 eprintln!("Server error: {}", e);
@@ -661,17 +647,18 @@ async fn main() {
         None
     };
 
-    let client_task = if host_choice != "host" {
+    let client_task = if ip == "host" {
+        let ip_clone = ip.clone();
         Some(tokio::spawn(async {
-            if let Err(e) = run_client(ip).await {
+            if let Err(e) = run_client(ip_clone).await {
                 eprintln!("Client error: {}", e);
             }
         }))
     } else {
         None
     };
-    // Run both tasks concurrently
-    if host_choice == "host" {
+
+    if ip == "host" {
         server_task.unwrap().await.unwrap();
     } else {
         // Only run the client task if no server is started
