@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
+use std::io::{stdout, Write};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,22 +13,37 @@ use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{timeout, Instant};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, poll, read, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::style::{style, Attribute, Color, Stylize};
+use crossterm::{QueueableCommand, cursor};
 use indexmap::IndexMap;
 use rand::distributions::Uniform;
 use rand::distributions::Distribution;
 use serde::de::DeserializeOwned;
-use crate::ServerMessage::Wager;
 
 const DIE_FACES: [[&str; 5]; 6] = [
-    ["---------", "|       |", "|   *   |", "|       |", "---------"],
-    ["---------", "|     * |", "|       |", "| *     |", "---------"],
-    ["---------", "|     * |", "|   *   |", "| *     |", "---------"],
-    ["---------", "| *   * |", "|       |", "| *   * |", "---------"],
-    ["---------", "| *   * |", "|   *   |", "| *   * |", "---------"],
-    ["---------", "| *   * |", "| *   * |", "| *   * |", "---------"]
+    ["╔═══════╗", "║       ║", "║   *   ║", "║       ║", "╚═══════╝"],
+    ["╔═══════╗", "║     * ║", "║       ║", "║ *     ║", "╚═══════╝"],
+    ["╔═══════╗", "║     * ║", "║   *   ║", "║ *     ║", "╚═══════╝"],
+    ["╔═══════╗", "║ *   * ║", "║       ║", "║ *   * ║", "╚═══════╝"],
+    ["╔═══════╗", "║ *   * ║", "║   *   ║", "║ *   * ║", "╚═══════╝"],
+    ["╔═══════╗", "║ *   * ║", "║ *   * ║", "║ *   * ║", "╚═══════╝"]
 ];
+const NUMBERS: [[&str; 5]; 10] = [
+    ["         ", "         ", "         ", "         ", "         "],
+    ["         ", "         ", "         ", "         ", "         "],
+    ["         ", "         ", "         ", "         ", "         "],
+    ["         ", "         ", "         ", "         ", "         "],
+    ["         ", "         ", "         ", "         ", "         "],
+    ["         ", "         ", "         ", "         ", "         "],
+    ["  █████  ", " ██      ", " ██████  ", " ██   ██ ", "  █████  "],
+    [" ███████ ", "      ██ ", "   ████  ", "    ██   ", "   ██    "],
+    ["  █████  ", " ██   ██ ", "  █████  ", " ██   ██ ", "  █████  "],
+    ["  █████  ", " ██   ██ ", "  ██████ ", "      ██ ", "  █████  "]
+];
+
+const CROSS: [&str; 5] = ["         ", "  ██ ██  ", "    █    ", "  ██ ██  ", "         "];
+
 
 #[derive(Serialize, Deserialize, Debug)]
 enum StartMessage {
@@ -133,16 +149,62 @@ impl From<serde_json::Error> for LiarsDiceError {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct PlayerSerialize {
     name: String,
-    die: Option<Vec<u8>>,
+    dice: Option<Vec<u8>>,
 }
 
-fn print_die_faces(arr: &[usize; 5]) {
-    for i in 0..6 {
-        for val in arr {
-            print!("{} ", DIE_FACES[val - 1][i]);
+fn print_die_faces(vec: &Vec<u8>) {
+    for i in 0..5 {
+        for val in vec.iter() {
+            print!("{} ", DIE_FACES[(*val - 1) as usize][i]);
         }
         println!();
     }
+}
+
+fn print_quantity(face: usize, quantity: usize) {
+    for i in 0..5 {
+        print!("{} ", DIE_FACES[face - 1][i]);
+        print!("{}", CROSS[i]);
+        println!("{}", NUMBERS[quantity][i]);
+    }
+    println!();
+}
+const COLOR_ORDER: [Color; 8] = [Color::Blue, Color::Red, Color::Green, Color::Yellow, Color::Cyan, Color::Magenta, Color::Grey, Color::Reset];
+
+fn print_table(vec: &Vec<PlayerSerialize>) {
+    // Count up dice
+    let mut dice_quantity: Vec<Vec<Color>> = Vec::new();
+    for (i, p) in vec.iter().enumerate() {
+        dice_quantity.push(Vec::new());
+        let dice = p.dice.clone().unwrap();
+        for die in dice {
+            dice_quantity[(die - 1) as usize].push(COLOR_ORDER[i]);
+        }
+    }
+    for (i, v) in dice_quantity.iter().enumerate() {
+        if v.len() > 6 {
+            print_quantity(i, v.len());
+        } else {
+            for col in 0..5 {
+                for color in v {
+                    print!("{} ", style(DIE_FACES[i][col]).with(*color));
+                }
+                println!();
+            }
+        }
+        println!()
+    }
+}
+
+fn print_wager(die_face: u8, die_quantity: u8) {
+    let (current_x, current_y) = cursor::position().unwrap();
+    let position: (u16, u16) = (current_x, current_y - 1);
+
+    stdout().queue(cursor::MoveTo(position.0, position.1)).unwrap();
+
+    println!("\rDie face: {}; Die quantity: {}", die_face, die_quantity);
+
+    let _ = stdout().flush();
 }
 
 fn serialize_message<T: Serialize>(input: &T) -> Vec<u8> {
@@ -182,13 +244,13 @@ async fn deserialize_message<T: DeserializeOwned>(
     }
 }
 
-async fn serialize_players(players_hash: Arc<AsyncMutex<IndexMap<SocketAddr, PlayerInfo>>>, include_die: bool) -> Vec<PlayerSerialize> {
+async fn serialize_players(players_hash: Arc<AsyncMutex<IndexMap<SocketAddr, PlayerInfo>>>, include_dice: bool) -> Vec<PlayerSerialize> {
     let mut players = players_hash.lock().await;
     let mut v = Vec::new();
     for player in players.values_mut() {
         v.push(PlayerSerialize {
             name: player.name.clone(),
-            die: if include_die { Some(player.dice.clone()) } else { None },
+            dice: if include_dice { Some(player.dice.clone()) } else { None },
         });
     }
 
@@ -435,34 +497,35 @@ async fn handle_client(
                     ClientMessage::DiceReady => {
                         let mut players = players_hash.lock().await;
                         let player = players.get_mut(&addr).unwrap();
-                        Some(&ClientMessage::ShuffleResult(player.dice.clone()))
+                        Some(ClientMessage::ShuffleResult(player.dice.clone()))
                     },
                     ClientMessage::SendAll(s_players) => {
-                        Some(&ClientMessage::SendAll(s_players))
+                        Some(ClientMessage::SendAll(s_players))
                     },
-                    ClientMessage::Wager(p_name, die_face, die_quantity) => {
-                        Some(&ClientMessage::Wager(p_name, die_face, die_quantity))
+                    ClientMessage::Wager(_, die_face, die_quantity) => {
+                        println!("Got wager from server!");
+                        Some(ClientMessage::Wager(name.clone(), die_face, die_quantity))
                     },
                     ClientMessage::CallLiar(p_name, retort) => {
-                        Some(&ClientMessage::CallLiar(p_name, retort))
+                        Some(ClientMessage::CallLiar(p_name, retort))
                     },
                     ClientMessage::CallExact(p_name, retort) => {
-                        Some(&ClientMessage::CallExact(p_name, retort))
+                        Some(ClientMessage::CallExact(p_name, retort))
                     },
                     ClientMessage::ExactCallCorrect(p_name) => {
-                        Some(&ClientMessage::ExactCallCorrect(p_name))
+                        Some(ClientMessage::ExactCallCorrect(p_name))
                     },
                     ClientMessage::PlayerBustedOut(p_name) => {
-                        Some(&ClientMessage::PlayerBustedOut(p_name))
+                        Some(ClientMessage::PlayerBustedOut(p_name))
                     },
                     ClientMessage::PlayerLostDie(p_name) => {
-                        Some(&ClientMessage::PlayerLostDie(p_name))
+                        Some(ClientMessage::PlayerLostDie(p_name))
                     },
                     ClientMessage::PlayerWon(p_name) => {
-                        Some(&ClientMessage::PlayerWon(p_name))
+                        Some(ClientMessage::PlayerWon(p_name))
                     },
                     ClientMessage::PlayerTurn(p_name) => {
-                        Some(&ClientMessage::PlayerTurn(p_name))
+                        Some(ClientMessage::PlayerTurn(p_name))
                     },
                     _ => None
                 };
@@ -470,7 +533,9 @@ async fn handle_client(
                     Some(msg) => {
                         let mut players = players_hash.lock().await;
                         let player = players.get_mut(&addr).unwrap();
+                        println!("Sending message to client...");
                         player.stream.write_all(serialize_message(&msg).as_slice()).await?;
+                        println!("Sent!");
 
                         match msg {
                             ClientMessage::PlayerTurn(_) => {},
@@ -480,12 +545,13 @@ async fn handle_client(
                     None => continue 'game_loop
                 }
             }
+            println!("Awaiting response from {}...", name.clone());
             let time_left = Duration::from_secs(30);
             'await_response: loop {
                 let start_time = Instant::now();
                 let timeout_result = {
                     let mut players = players_hash.lock().await;
-                    let mut player = players.get_mut(&addr).unwrap();
+                    let player = players.get_mut(&addr).unwrap();
                     timeout(time_left, deserialize_message(&mut player.stream)).await
                 };
                 let elapsed = start_time.elapsed();
@@ -502,6 +568,7 @@ async fn handle_client(
                         return Err(LiarsDiceError::TimeoutError);
                     },
                 };
+                println!("Got something");
 
                 let message: ClientMessage = match message_received {
                     Ok(x) => match x {
@@ -510,14 +577,18 @@ async fn handle_client(
                     },
                     Err(_) => continue 'await_response,
                 };
+                println!("Got message: {:?}", message);
                 match message {
                     ClientMessage::Wager(_, die_face, die_quantity) => {
+                        println!("Sending wager to server...");
                         if !(1..=6).contains(&die_face) {
+                            eprintln!("Invalid die face");
                             continue 'await_response;
                         }
                         if let Err(_) = mpsc_tx.send(ClientMessage::Wager(name.clone(), die_face, die_quantity)).await {
                             eprintln!("Failed to send message to server");
                         }
+                        println!("Sent wager!");
                         break 'await_response;
                     },
                     ClientMessage::CallLiar(_, _) => {
@@ -686,21 +757,31 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                 'await_response: loop {
                     let message_received = server_rx.recv().await;
                     let message = match message_received {
-                        Some(x) => x,
-                        None => {
-                            if let Err(_) = broadcast_tx.send(ClientMessage::TimeOutClient(cur_player_name.clone()))
-                            {
-                                eprintln!("Failed to send broadcast");
+                        Some(x) => {
+                            println!("Got message from task");
+                            match x.clone() {
+                                ClientMessage::TimeOutClient(p_name) if p_name == cur_player_name => {
+                                    println!("Client timed out");
+                                    if let Err(_) = broadcast_tx.send(ClientMessage::TimeOutClient(cur_player_name.clone()))
+                                    {
+                                        eprintln!("Failed to send broadcast");
+                                        break 'turn_loop;
+                                    }
+                                },
+                                _ => {}
                             }
-                            break 'turn_loop;
+                            x
                         },
+                        None => break 'turn_loop,
                     };
+                    println!("Got message from task: {:?}", message);
                     match message {
                         ClientMessage::Wager(p_name, die_face, die_quantity) if p_name == cur_player_name => {
                             if let Err(_) = broadcast_tx.send(ClientMessage::Wager(p_name, die_face, die_quantity))
                             {
                                 eprintln!("Failed to send broadcast");
                             }
+                            println!("Sent wager to tasks");
                             cur_wager = (die_face, die_quantity);
                             first_turn = false;
                             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -708,6 +789,10 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                         },
                         ClientMessage::CallLiar(p_name, _) if p_name == cur_player_name && !first_turn => {
                             if let Err(_) = broadcast_tx.send(ClientMessage::CallLiar(p_name.clone(), generate_retort_val()))
+                            {
+                                eprintln!("Failed to send broadcast");
+                            }
+                            if let Err(_) = broadcast_tx.send(ClientMessage::SendAll(serialize_players(players_hash.clone(), true).await))
                             {
                                 eprintln!("Failed to send broadcast");
                             }
@@ -766,6 +851,10 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                         },
                         ClientMessage::CallExact(p_name, _) if p_name == cur_player_name && !first_turn => {
                             if let Err(_) = broadcast_tx.send(ClientMessage::CallExact(p_name.clone(), generate_retort_val()))
+                            {
+                                eprintln!("Failed to send broadcast");
+                            }
+                            if let Err(_) = broadcast_tx.send(ClientMessage::SendAll(serialize_players(players_hash.clone(), true).await))
                             {
                                 eprintln!("Failed to send broadcast");
                             }
@@ -973,7 +1062,7 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                     println!("{} joined", p_name);
                     players.push(PlayerSerialize {
                         name: p_name,
-                        die: None
+                        dice: None
                     });
                 },
                 ClientMessage::VoteStart(p_name, p_vote, n_votes, n_players) => {
@@ -992,6 +1081,7 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
             }
         }
         let mut first_turn = true;
+        let mut dice: Vec<u8>;
         let mut current_wager: (u8, u8);
         let mut cur_player_name  = String::from("");
         let mut prev_player_name = String::from("");
@@ -1032,6 +1122,10 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                 // Read message content
                 // todo!("Write the rest of the cases")
                 match client_message {
+                    ClientMessage::ShuffleResult(shuffled) => {
+                        dice = shuffled;
+                        print_die_faces(&dice);
+                    },
                     ClientMessage::Wager(p_name, die_face, die_quantity) => {
                         println!("{} wagered {} {}'s", p_name, num_to_word(die_face, WordStyle::LowerCase), die_quantity);
                         current_wager = (die_face, die_quantity);
@@ -1039,12 +1133,14 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                     },
                     ClientMessage::CallLiar(p_name, retort) => {
                         println!("{} called {} a liar! {}", p_name, prev_player_name.clone(), generate_retort(retort));
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                     },
                     ClientMessage::CallExact(p_name, retort) => {
                         println!("{} thinks the wager's just right. {}", p_name, generate_retort(retort));
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                     },
+                    ClientMessage::SendAll(s_players) => {
+                        players = s_players;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
                     ClientMessage::PlayerLostDie(p_name) => {
                         match prev_play {
                             PreviousPlay::CallBluff => {
@@ -1093,8 +1189,9 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                     _ => {}
                 }
             }
-            let mut die_face: u8 = 0;
-            let mut die_quantity: u8 = 0;
+            let mut die_face: u8 = 1;
+            let mut die_quantity: u8 = 1;
+            println!("Die face: {}; Die quantity: {}", die_face, die_quantity);
             'turn_loop: loop {
                 // Player's turn
                 // Poll for an event (non-blocking, with a timeout)
@@ -1110,20 +1207,24 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                                     match code {
                                         KeyCode::Char('w') if die_face < 6 => {
                                             die_face += 1;
+                                            print_wager(die_face, die_quantity);
                                         },
                                         KeyCode::Char('s') if die_face > 1 => {
                                             die_face -= 1;
+                                            print_wager(die_face, die_quantity);
                                         },
                                         KeyCode::Char('a') if die_quantity > 1 => {
                                             die_quantity -= 1;
+                                            print_wager(die_face, die_quantity);
                                         },
                                         KeyCode::Char('d') if die_quantity < u8::MAX => {
                                             die_quantity += 1;
+                                            print_wager(die_face, die_quantity);
                                         },
                                         KeyCode::Char('l') if !first_turn => {
                                             let _ = stream
                                             .write_all(
-                                                serialize_message(&ClientMessage::CallLiar(name.clone()))
+                                                serialize_message(&ClientMessage::CallLiar(name.clone(), 0))
                                                     .as_slice(),
                                             )
                                             .await;
@@ -1131,12 +1232,13 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                                         KeyCode::Char('k') if !first_turn => {
                                             let _ = stream
                                                 .write_all(
-                                                    serialize_message(&ClientMessage::CallExact(name.clone()))
+                                                    serialize_message(&ClientMessage::CallExact(name.clone(), 0))
                                                         .as_slice(),
                                                 )
                                                 .await;
                                         }
                                         KeyCode::Enter => {
+                                            println!("Enter registered");
                                             let _ = stream
                                                 .write_all(
                                                     serialize_message(&ClientMessage::Wager(name.clone(), die_face, die_quantity))
