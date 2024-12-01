@@ -147,6 +147,7 @@ Notes:
 - [x] Work on actual game loop
 - [x] Fixing bugs
 - [x] Complete base game logic
+- [ ] Add optimization options for hosts like thread caps, custom ports, player limits, passwords, better logging, etc.
 - [ ] Working on improved visuals
 - [ ] Add homebrew options (wild 1's, different rules for making wagers, etc)
 - [ ] Rewrite with streamlined lobby and multiplayer system
