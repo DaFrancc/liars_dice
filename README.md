@@ -113,6 +113,7 @@ _For more examples, please refer to the [Documentation](https://example.com)_
 - [x] Complete base game logic
 - [ ] Working on improved visuals
 - [ ] Add homebrew options (wild 1's, different rules for making wagers, etc)
+- [ ] Rewrite with streamlined lobby and multiplayer system
 
 See the [open issues](https://github.com/DaFrancc/liars_dice/issues?q=sort%3Aupdated-desc+is%3Aissue+is%3Aopen) for a full list of proposed features (and known issues).
 
