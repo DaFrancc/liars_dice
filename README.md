@@ -60,11 +60,11 @@ A simple terminal game based off of the classic liar's dice table top game. Buil
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-### Prerequisites
+## Prerequisites
 
 * [Cargo](https://rust-lang.org)
 
-### Installation
+## Installation
 
 1. Clone the repo
    ```sh
