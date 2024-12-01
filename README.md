@@ -121,7 +121,7 @@ or you can press 'A' and 'D' to increase and decrease the quantity of the wager,
 is between 1 and 255. A valid wager must either have a higher face value with the same quantity, the same face value with a higher quantity, or
 both a higher face value and a higher quantity.
 
-Players will progressively take turns casting wagers until you decide to call someone's bluff, or if you think the wager is exactly right.
+Players will progressively take turns casting wagers until you decide to call someone's bluff 'L', or if you think the wager is exactly right 'K'.
 If you call someone's bluff and that person was wrong, they lose a die. If you call someone's bluff and you were wrong, you lose a die.
 If you think the previous wager was exactly right (no more, no less) and you were wrong, you lose a die. If you were right, you keep your die.
 You may only call a bluff or call an exact wager after the first wager has been cast.
