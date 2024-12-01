@@ -46,6 +46,7 @@
     <li><a href="#usage">Usage</a></li>
     <li><a href="#roadmap">Roadmap</a></li>
     <li><a href="#license">License</a></li>
+    <li><a href="#credits">Credits</a></li>
   </ol>
 </details>
 
@@ -124,6 +125,12 @@ See the [open issues](https://github.com/DaFrancc/liars_dice/issues?q=sort%3Aupd
 
 Distributed under the MIT License. See `LICENSE.txt` for more information.
 
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- CREDITS -->
+## Credits
+
+Credit to [othneildrew](https://github.com/othneildrew/Best-README-Template) for this README template.
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
