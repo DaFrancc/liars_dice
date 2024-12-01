@@ -44,6 +44,7 @@
       </ul>
     </li>
     <li><a href="#usage">Usage</a></li>
+    <li><a href="#howtoplay">Usage</a></li>
     <li><a href="#roadmap">Roadmap</a></li>
     <li><a href="#license">License</a></li>
     <li><a href="#credits">Credits</a></li>
@@ -91,16 +92,51 @@ This will launch a server instance. You can then run a client instance on the sa
   ```sh
   liars_dice 127.0.0.1:6969
   ```
-or you may join your friend with his IP like so
+or you may join your friend with his IP like so (don't share your IP with people you don't trust!)
   ```sh
   liars_dice <friend IP>:6969
   ```
 Clients do not need to do any more setup beyond downloading the game and joining you with the above commands.
 
-_For more examples, please refer to the [Documentation](https://example.com)_
+<!-- _For more examples, please refer to the [Documentation](https://example.com)_ -->
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
+## How to play
+
+Once you've typed in the join command, you will be prompted for a username. Pick one that has not already been chosen by another player
+or else you will be kicked from the server.
+
+You will then join the lobby where you can wait for your friends to join. There is no set player limit, however high player counts
+may cause unintended side effects on the stability of the game, lead to high stress on the server, slow down the performance of the game,
+and lead to much longer game times.
+
+Players can press 'Y' to vote to start the game or 'N' to recind their vote. All players must vote 'Y' to start the game.
+
+Once the game has started, players will be given their random dice, a random player will start, and then continue in the order
+in which players joined the game.
+
+When it is your turn, you will be prompted to choose your wager. You can press 'W' and 'S' to increase and decrease the face value, respectively
+or you can press 'A' and 'D' to increase and decrease the quantity of the wager, respectively. The face value is between 1 and 6 and the quantity
+is between 1 and 255. A valid wager must either have a higher face value with the same quantity, the same face value with a higher quantity, or
+both a higher face value and a higher quantity.
+
+Players will progressively take turns casting wagers until you decide to call someone's bluff, or if you think the wager is exactly right.
+If you call someone's bluff and that person was wrong, they lose a die. If you call someone's bluff and you were wrong, you lose a die.
+If you think the previous wager was exactly right (no more, no less) and you were wrong, you lose a die. If you were right, you keep your die.
+You may only call a bluff or call an exact wager after the first wager has been cast.
+
+The game continues until there is only one person with dice left remaining.
+
+Notes:
+- If a player takes longer than 60 seconds to cast a wager, they automatically lose a die.
+- If a player leaves in the middle of a game, unexpected behavior is to be expected and the game may crash (working on a fix).
+- You don't have to call a bluff or an exact wager, you could just keep going until the game won't let you any more. The only upper limit is the
+  fact that the quantities are stored in 8-bit unsigned integers.
+
+<!-- _For more examples, please refer to the [Documentation](https://example.com)_ -->
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
 <!-- ROADMAP -->
