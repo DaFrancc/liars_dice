@@ -13,12 +13,11 @@ use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{timeout, Instant};
-use crossterm::event::{self, poll, read, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::style::{style, Attribute, Color, Stylize};
 use crossterm::{QueueableCommand, cursor};
 use indexmap::IndexMap;
 use rand::distributions::Uniform;
-use rand::distributions::Distribution;
 use rand::{Rng, SeedableRng};
 use serde::de::DeserializeOwned;
 use num2words::Num2Words;
@@ -46,7 +45,7 @@ const NUMBERS: [[&str; 5]; 10] = [
 
 const CROSS: [&str; 5] = ["         ", "  ██ ██  ", "    █    ", "  ██ ██  ", "         "];
 
-const NUM_DICE: u8 = 5;
+const NUM_DICE: u8 = 2;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum StartMessage {
@@ -107,11 +106,13 @@ enum ClientMessage {
     Kick(String),
 }
 
+// In the future, use fine-grained locking to prevent deadlock
+// and to avoid using options
 struct PlayerInfo {
     name: String,
     dice: Vec<u8>,
     start_game: bool,
-    stream: TcpStream,
+    stream: Option<TcpStream>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,10 +294,10 @@ async fn client_join(
     match message {
         StartMessage::Join(name) => {
             // If name already exists, reject client and continue to next request
-            let mut players = players_hash.lock().await;
             if name.is_empty() {
                 return Err(LiarsDiceError::Other(String::from("Name cannot be empty")));
             }
+            let mut players = players_hash.lock().await;
             if players.values().filter(|p| p.name == name).count() != 0 {
                 drop(players);
                 eprintln!("Player with name {name} already joined");
@@ -313,7 +314,7 @@ async fn client_join(
                 name,
                 dice: Vec::new(),
                 start_game: false,
-                stream: socket,
+                stream: Some(socket),
             });
 
             num_players.fetch_add(1, Ordering::Relaxed);
@@ -352,10 +353,13 @@ async fn handle_client(
     let mut retries = 0;
     const MAX_RETRIES: usize = 5;
 
+    #[allow(unused_labels)]
     'super_loop: loop {
         let name = {
             let mut players = players_hash.lock().await;
             let player = players.get_mut(&addr).unwrap();
+            player.start_game = false;
+            player.dice = Vec::new();
             player.name.clone()
         };
         // Lobby loop
@@ -373,13 +377,24 @@ async fn handle_client(
                 match serialized {
                     Ok(s) => {
                         let mut players = players_hash.lock().await;
-                        let player = match players.get_mut(&addr) {
+                        let mut player = match players.get_mut(&addr) {
                             Some(p) => p,
                             None => {
                                 return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
                             },
                         };
-                        player.stream.write_all(serialize_message(&s).as_slice()).await?;
+                        let mut stream = player.stream.take().unwrap();
+                        drop(players);
+                        stream.write_all(serialize_message(&s).as_slice()).await?;
+                        players = players_hash.lock().await;
+                        player = match players.get_mut(&addr) {
+                            Some(p) => p,
+                            None => {
+                                return Err(LiarsDiceError::Other(format!("{addr} is not in hashmap")));
+                            },
+                        };
+                        player.stream = Some(stream);
+                        drop(players);
 
                         match s {
                             ClientMessage::Kick(p_name) if p_name == name => {
@@ -397,9 +412,14 @@ async fn handle_client(
             // Take stream and clone name without holding onto the lock
             let timeout_result = {
                 let mut players = players_hash.lock().await;
-                let player = players.get_mut(&addr).unwrap();
-
-                timeout(Duration::from_millis(20), deserialize_message(&mut player.stream)).await
+                let mut player = players.get_mut(&addr).unwrap();
+                let mut stream = player.stream.take().unwrap();
+                drop(players);
+                let ret_val = timeout(Duration::from_millis(20), deserialize_message(&mut stream)).await;
+                players = players_hash.lock().await;
+                player = players.get_mut(&addr).unwrap();
+                player.stream = Some(stream);
+                ret_val
             };
             // Test connection
             let message_received: Result<Option<StartMessage>, LiarsDiceError> = timeout_result.unwrap_or_else(|_| Ok(None));
@@ -535,47 +555,62 @@ async fn handle_client(
             };
             match message {
                 Some(msg) => {
-                    println!("{} Acquire lock 2", name.clone());
                     let mut players = players_hash.lock().await;
-                    let player = players.get_mut(&addr).unwrap();
-                    player.stream.write_all(serialize_message(&msg).as_slice()).await?;
+                    let mut player = players.get_mut(&addr).unwrap();
+                    let mut stream = player.stream.take().unwrap();
                     drop(players);
-                    println!("{} Drop lock 2", name.clone());
+                    stream.write_all(serialize_message(&msg).as_slice()).await?;
+                    players = players_hash.lock().await;
+                    player = players.get_mut(&addr).unwrap();
+                    player.stream = Some(stream);
+                    drop(players);
                     match msg {
                         ClientMessage::PlayerTurn(p_name) => {
                             if p_name != name.clone() {
                                 continue 'game_loop;
                             }
                         },
+                        ClientMessage::PlayerWon(_) => {
+                            break 'game_loop;
+                        }
                         _ => continue 'game_loop,
                     }
                 },
                 None => continue 'game_loop
             }
             println!("Awaiting response from {}...", name.clone());
-            let time_left = Duration::from_secs(30);
+            let time_left = Duration::from_secs(60);
             'await_response: loop {
                 let start_time = Instant::now();
                 let timeout_result = {
-                    println!("{} Acquire lock 3", name.clone());
+                    // println!("{} Acquire lock 3", name.clone());
                     let mut players = players_hash.lock().await;
-                    let player = players.get_mut(&addr).unwrap();
-                    timeout(time_left, deserialize_message(&mut player.stream)).await
+                    let mut player = players.get_mut(&addr).unwrap();
+                    let mut stream = player.stream.take().unwrap();
+                    drop(players);
+                    let ret_val = timeout(time_left, deserialize_message(&mut stream)).await;
+                    players = players_hash.lock().await;
+                    player = players.get_mut(&addr).unwrap();
+                    player.stream = Some(stream);
+                    ret_val
                 };
-                println!("{} Drop lock 3", name.clone());
+                // println!("{} Drop lock 3", name.clone());
                 let elapsed = start_time.elapsed();
                 let _ = time_left.checked_sub(elapsed);
                 let message_received: Result<Option<ClientMessage>, LiarsDiceError> = match timeout_result {
                     Ok(x) => x,
                     Err(_) => {
-                        println!("{} Acquire lock 5", name.clone());
                         let mut players = players_hash.lock().await;
-                        let player = players.get_mut(&addr).unwrap();
-                        let _ = player.stream.write_all(serialize_message(&ClientMessage::TimeOutClient(name.clone())).as_slice()).await;
-                        let _ = player.stream.flush().await;
+                        let mut player = players.get_mut(&addr).unwrap();
+                        let mut stream = player.stream.take().unwrap();
+                        drop(players);
+                        let _ = stream.write_all(serialize_message(&ClientMessage::TimeOutClient(name.clone())).as_slice()).await;
+                        let _ = stream.flush().await;
+                        players = players_hash.lock().await;
+                        player = players.get_mut(&addr).unwrap();
+                        player.stream = Some(stream);
                         players.shift_remove(&addr);
                         num_players.fetch_sub(1, Ordering::SeqCst);
-                        println!("{} Drop lock 5", name.clone());
                         return Err(LiarsDiceError::TimeoutError);
                     },
                 };
@@ -616,7 +651,6 @@ async fn handle_client(
             }
         }
     }
-    Ok(())
 }
 
 async fn run_server() -> Result<(), LiarsDiceError> {
@@ -637,7 +671,9 @@ async fn run_server() -> Result<(), LiarsDiceError> {
     // Create an mpsc channel for clients-to-server communication
     let (server_tx, mut server_rx): (Sender<ClientMessage>, mpsc::Receiver<ClientMessage>) = mpsc::channel(32);
 
+    #[allow(unused_labels)]
     'super_loop: loop {
+        num_votes_atomic.store(0, Ordering::SeqCst);
         // Lobby loop
         'lobby_loop: loop {
             if let Ok(msg) = server_rx.try_recv() {
@@ -703,9 +739,21 @@ async fn run_server() -> Result<(), LiarsDiceError> {
 
         let keys = players_hash.lock().await.keys().cloned().collect::<Vec<_>>();
 
+        let mut remaining_players = num_players_atomic.load(Ordering::SeqCst);
+        let mut cur_player_name = String::from("");
         // Game loop
         'game_loop: loop {
-            { // Acquire lock
+            if remaining_players == 1 {
+                if let Err(_) = broadcast_tx.send(ClientMessage::PlayerWon(cur_player_name.clone()))
+                {
+                    eprintln!("Failed to send broadcast");
+                }
+                break 'game_loop;
+            } else if remaining_players == 0 {
+                eprintln!("Error, no players remaining. Stopping game and moving to lobby...");
+                break 'game_loop;
+            }
+            let mut cur_player_turn = { // Acquire lock
                 let mut rng = rand::rngs::StdRng::from_entropy();
                 let dist = Uniform::from(1u8..=6u8);
                 let mut players = players_hash.lock().await;
@@ -714,21 +762,23 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                         *die = rng.sample(dist);
                     }
                 }
-            } // Drop lock
+                rng.sample(Uniform::from(0..remaining_players))
+            }; // Drop lock
             // Set up game
-            let mut cur_player_turn = 0;
             if let Err(_) = broadcast_tx.send(ClientMessage::DiceReady) {
                 eprintln!("Failed to send broadcast");
             }
+            #[allow(unused_assignments)]
             let mut prev_player_turn: usize = 0;
-            let mut remaining_players = num_players_atomic.load(Ordering::SeqCst);
             let mut first_turn = true;
+            #[allow(unused_assignments)]
             let mut prev_player_name: String = String::from("");
-            let mut cur_player_name: String = String::from("");
             let mut cur_wager: (u8, u8) = (1, 1); // (face, quantity)
             // Turn loop
             'turn_loop: loop {
+                println!("{remaining_players} players remaining");
                 prev_player_turn = cur_player_turn;
+                prev_player_name = cur_player_name;
                 { // Acquire lock
                     let mut players = players_hash.lock().await;
                     let connected_players = num_players_atomic.load(Ordering::SeqCst);
@@ -738,32 +788,14 @@ async fn run_server() -> Result<(), LiarsDiceError> {
                             break;
                         }
                     }
-                } // Drop lock
-                if remaining_players == 1 {
-                    if let Err(_) = broadcast_tx.send(ClientMessage::PlayerWon(cur_player_name.clone()))
-                    {
-                        eprintln!("Failed to send broadcast");
-                    }
-                    break 'game_loop;
-                } else if remaining_players == 0 {
-                    eprintln!("Error, no players remaining. Stopping game and moving to lobby...");
-                    break 'game_loop;
-                }
-                prev_player_name = cur_player_name;
-                { // Acquire players lock
-                    cur_player_name = players_hash
-                        .lock()
-                        .await
-                        .get(&keys[cur_player_turn])
-                        .unwrap()
-                        .name
-                        .clone();
+                    cur_player_name = players.get(&keys[cur_player_turn]).unwrap().name.clone();
                 } // Drop lock
                 println!("Broadcast: It's {}'s turn!", cur_player_name);
                 if let Err(_) = broadcast_tx.send(ClientMessage::PlayerTurn(cur_player_name.clone()))
                 {
                     eprintln!("Failed to send broadcast");
                 }
+                #[allow(unused_labels)]
                 'await_response: loop {
                     let message_received = server_rx.recv().await;
                     let message = match message_received {
@@ -914,7 +946,6 @@ async fn run_server() -> Result<(), LiarsDiceError> {
             }
         }
     }
-    Ok(())
 }
 
 enum PreviousPlay {
@@ -972,11 +1003,13 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
     let mut retries = 0;
     const MAX_RETRIES: usize = 5;
 
-    println!("Press 'q' to exit");
-    println!("Start game? (y/n)");
-    let mut vote = false;
     // Lobby loop
+    #[allow(unused_labels)]
     'super_loop: loop {
+        println!("Press 'q' to exit");
+        println!("Start game? (y/n)");
+        let mut vote = false;
+        #[allow(unused_labels)]
         'lobby_loop: loop {
             // Poll for an event (non-blocking, with a timeout)
             if event::poll(Duration::from_millis(1))? {
@@ -1132,21 +1165,23 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                     Some(x) => x,
                     None => continue,
                 };
-                println!("{:?}", client_message);
 
                 // Read message content
                 // todo!("Write the rest of the cases")
                 match client_message {
                     ClientMessage::ShuffleResult(shuffled) => {
                         dice = shuffled;
+                        if dice.is_empty() {
+                            println!("You're out. You can either leave or wait for a new game to start.");
+                        } else {
+                            print_die_faces(&dice);
+                        }
                         current_wager = (1, 1);
-                        print_die_faces(&dice);
                     },
                     ClientMessage::Wager(p_name, die_face, die_quantity) => {
-                        println!("{} wagered {} {}'s", p_name, num_to_word(die_quantity, WordStyle::LowerCase), die_face);
+                        println!("{} wagered {} {}{}", p_name, num_to_word(die_quantity, WordStyle::LowerCase), die_face, if die_quantity > 1 {"'s"} else {""});
                         current_wager = (die_face, die_quantity);
                         first_turn = false;
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                     },
                     ClientMessage::CallLiar(p_name, retort) => {
                         println!("{} called {} a liar! {}", p_name, prev_player_name.clone(), generate_reveal(retort));
@@ -1158,7 +1193,6 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                     },
                     ClientMessage::SendAll(s_players) => {
                         players = s_players;
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                     ClientMessage::PlayerLostDie(p_name) => {
                         first_turn = true;
@@ -1175,20 +1209,16 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                             },
                             _ => {}
                         }
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                     },
                     ClientMessage::ExactCallCorrect(p_name) => {
                         first_turn = true;
                         println!("Holy cow! {} was exactly right! You keep your die!", p_name);
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                     },
                     ClientMessage::PlayerBustedOut(p_name) => {
                         println!("It is not {}'s day today. You busted out.", p_name);
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                     },
                     ClientMessage::PlayerWon(p_name) => {
                         println!("That settles it folks! {} won!", p_name);
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                         break 'game_loop;
                     }
                     ClientMessage::PlayerTurn(p_name) => {
@@ -1219,7 +1249,7 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
                 // Player's turn
                 // Poll for an event (non-blocking, with a timeout)
                 if event::poll(Duration::from_millis(1))? {
-                    if let Event::Key(KeyEvent { code, modifiers, kind, .. }) = event::read()? {
+                    if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
                         match kind {
                             // Handle key press
                             KeyEventKind::Press => {
@@ -1290,8 +1320,6 @@ async fn run_client(ip: String) -> Result<(), LiarsDiceError> {
             }
         }
     }
-
-    Ok(())
 }
 
 const REVEAL_RANGE: RangeInclusive<u8> = 0u8..=5u8;
