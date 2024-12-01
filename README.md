@@ -107,7 +107,8 @@ _For more examples, please refer to the [Documentation](https://example.com)_
 
 - [x] Set up networking
 - [x] Get basic communication between client and server
-- [ ] Work on actual game loop
+- [x] Work on actual game loop
+- [ ] Fixing bugs
 
 See the [open issues](https://github.com/DaFrancc/liars_dice/issues?q=sort%3Aupdated-desc+is%3Aissue+is%3Aopen) for a full list of proposed features (and known issues).
 
