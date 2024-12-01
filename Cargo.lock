@@ -154,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "indexmap",
+ "num2words",
  "rand",
  "serde",
  "serde_json",
@@ -214,6 +215,21 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "num-bigfloat"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5ee1e61b978cc2196731ebb9e349d6f27b99750ad674ae7a2f26ae6e93be7e4"
+
+[[package]]
+name = "num2words"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ab78b987a0e1e6cf869a443f7f1c9dc696117d47780227e961e742d0b45d706"
+dependencies = [
+ "num-bigfloat",
 ]
 
 [[package]]
