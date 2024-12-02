@@ -1,0 +1,1 @@
+Send PlayerLeft message to server every time that handle_client returns
