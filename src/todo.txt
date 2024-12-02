@@ -1,1 +1,2 @@
 Send PlayerLeft message to server every time that handle_client returns
+Limit size of data that deserialize accepts. 1000bytes?
