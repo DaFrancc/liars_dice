@@ -57,6 +57,7 @@
 ## About The Project
 
 A simple terminal game based off of the classic liar's dice table top game. Build in rust using TCP protocols.
+At this time, it is undergoing a major rewrite. I'm making a separate crate that will both support thr same functionality as this game, as well as othet types of games.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
