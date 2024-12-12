@@ -1,3 +1,4 @@
 Send PlayerLeft message to server every time that handle_client returns
 Limit size of data that deserialize accepts. 1000bytes?
 Convert player list to Vec<Arc<Player>> to remove mutexes. no fine or coarse grained locking needed.
+Change deserialize to an array since max message length is set at 1KiB.
