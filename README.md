@@ -85,15 +85,15 @@ At this time, it is undergoing a major rewrite. I'm making a separate crate that
 ## Usage
 
 To start, you must first port forward port 6969 for TCP (you can also do so for UDP however this project only uses TCP).
-To host a server, you launch one instance with the command
+To host a server, you launch a server instance with the command
   ```sh
   liars_dice host
   ```
-This will launch a server instance. You can then run a client instance on the same machine to join your server with
+If you wish to play the game on the same machine, you can join your server with
   ```sh
   liars_dice 127.0.0.1:6969
   ```
-or you may join your friend with his IP like so (don't share your IP with people you don't trust!)
+You may also join your friend with his IP like so (don't share your IP with people you don't trust!)
   ```sh
   liars_dice <friend IP>:6969
   ```
@@ -106,16 +106,17 @@ Clients do not need to do any more setup beyond downloading the game and joining
 ## How to play
 
 Once you've typed in the join command, you will be prompted for a username. Pick one that has not already been chosen by another player
-or else you will be kicked from the server.
+or else you will be kicked from the server. You will have to use one of the above commands to try joining again.
 
 You will then join the lobby where you can wait for your friends to join. There is no set player limit, however high player counts
 may cause unintended side effects on the stability of the game, lead to high stress on the server, slow down the performance of the game,
-and lead to much longer game times.
+lead to much longer game times, and/or cause other unexpected issues. No testing has been done to confirm nor deny these possible side effects.
 
 Players can press 'Y' to vote to start the game or 'N' to recind their vote. All players must vote 'Y' to start the game.
 
 Once the game has started, players will be given their random dice, a random player will start, and then continue in the order
-in which players joined the game.
+in which players joined the game. Once the last player has finished his turn, the game will loop around and continue with the first player
+to join.
 
 When it is your turn, you will be prompted to choose your wager. You can press 'W' and 'S' to increase and decrease the face value, respectively
 or you can press 'A' and 'D' to increase and decrease the quantity of the wager, respectively. The face value is between 1 and 6 and the quantity
@@ -123,17 +124,26 @@ is between 1 and 255. A valid wager must either have a higher face value with th
 both a higher face value and a higher quantity.
 
 Players will progressively take turns casting wagers until you decide to call someone's bluff 'L', or if you think the wager is exactly right 'K'.
-If you call someone's bluff and that person was wrong, they lose a die. If you call someone's bluff and you were wrong, you lose a die.
-If you think the previous wager was exactly right (no more, no less) and you were wrong, you lose a die. If you were right, you keep your die.
-You may only call a bluff or call an exact wager after the first wager has been cast.
+If you call someone's bluff and that person wagered higher than the table, he loses a die. If you call someone's bluff and the wager was less than 
+or equal to the table, you lose a die. If you think the previous wager was exactly right (no more, no less) and you were wrong, you lose a die. 
+If you were right, you keep your die. You may only call a bluff or call an exact wager after the first wager has been cast. 
 
 The game continues until there is only one person with dice left remaining.
 
 Notes:
-- If a player takes longer than 60 seconds to cast a wager, they automatically lose a die.
+- If a player takes longer than 60 seconds to cast a wager, he gets kicked.
 - If a player leaves in the middle of a game, unexpected behavior is to be expected and the game may crash (working on a fix).
 - You don't have to call a bluff or an exact wager, you could just keep going until the game won't let you any more. The only upper limit is the
-  fact that the quantities are stored in 8-bit unsigned integers.
+  fact that the quantities are stored in 8-bit unsigned integers. This might be updated in the future to protect the illusion of the game.
+- At this moment there is an issue on some linux terminals (I've tested on Konsole and Alacritty) where input is buffered and you must press
+  'ENTER' to register a keystroke. Windows terminal doesn't seem to have this issue. I'm working on a fix for this by enabling raw input,
+  however it messes up the formatting and prevents users from quitting via 'CTRL+C'. This is probably not an issue for future updates
+  since I will be adding actually good visuals and better control flow. If you are able to enable raw input through the console, it might work.
+  I have not tested this, however.
+- You are free to modify this game. I only ask that if you decide to publish your modified version that you credit me as the original author.
+  I will stop updating this game after the proposed roadmap is complete and all major bugs have been squashed. My efforts will continue with
+  my new proposed generic tabletop crate. I might make poker or something a bit more dynamic to test its limits.
+  
 
 <!-- _For more examples, please refer to the [Documentation](https://example.com)_ -->
 
@@ -152,6 +162,8 @@ Notes:
 - [ ] Working on improved visuals
 - [ ] Add homebrew options (wild 1's, different rules for making wagers, etc)
 - [ ] Rewrite with streamlined lobby and multiplayer system
+- [ ] Ensure stability on Linux and Windows (Mac users are on their own)
+- [ ] Make pre-compiled binaries for Linux and Windows (Mac users must build from source)
 
 See the [open issues](https://github.com/DaFrancc/liars_dice/issues?q=sort%3Aupdated-desc+is%3Aissue+is%3Aopen) for a full list of proposed features (and known issues).
 
@@ -162,7 +174,7 @@ See the [open issues](https://github.com/DaFrancc/liars_dice/issues?q=sort%3Aupd
 <!-- LICENSE -->
 ## License
 
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+Distributed under the MIT License. See `LICENSE` for more information.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
